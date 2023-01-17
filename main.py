@@ -1,15 +1,32 @@
 import datetime
+import logging
 
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Response, status, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from sqlalchemy import Boolean, Column, String, Integer, DateTime, Table
+from sqlalchemy import Boolean, Column, String, Integer, DateTime
 
 app = FastAPI()
+
+origins = [
+    "http://localhost.tiangolo.com",
+    "https://localhost.tiangolo.com",
+    "http://localhost",
+    "http://localhost:8080",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # SqlAlchemy Setup
 load_dotenv()
@@ -36,7 +53,7 @@ class ProjectVotesDB(Base):
     ProjectCountry = Column(String)
     IconCode = Column(String)
     GraphColour = Column(String)
-    VoteCount = Column(Integer)
+    VoteCount = Column(Integer, nullable=True)
 
 
 class VoucherCodesDB(Base):
@@ -76,8 +93,52 @@ def get_all_project_votes(db: Session):
     return db.query(ProjectVotesDB).all()
 
 
+def update_project_vote_count(db: Session, proj_id: int):
+    # Update the project vote count for the current project being voted for
+    project_vote = db.query(ProjectVotesDB).where(ProjectVotesDB.ProjectID == proj_id).first()
+
+    if project_vote:
+        new_count = db.execute("SELECT COUNT(*) FROM voucher_codes WHERE ProjectID = %d" % proj_id).scalar()
+        print("NEW COUNT " + str(new_count))
+        if project_vote.VoteCount != new_count:
+            project_vote.VoteCount = new_count
+            db.add(project_vote)
+            db.commit()
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found, please check project id is valid!"
+        )
+
+
 def get_voucher(db: Session, code: int):
     return db.query(VoucherCodesDB).where(VoucherCodesDB.Voucher == code).first()
+
+
+def update_voucher(db: Session, code: int, proj_vote: int):
+    voucher = get_voucher(db, code)
+
+    if voucher:
+        # check if voucher is still in date and has not been used
+        is_not_expired = voucher.ExpiryDate != datetime.datetime.now()
+        is_not_used = not voucher.Used
+
+        if is_not_expired and is_not_used:
+            voucher.ExpiryDate = datetime.datetime.now()
+            voucher.Used = True
+            voucher.ProjectID = proj_vote
+            db.add(voucher)
+            db.commit()
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_406_NOT_ACCEPTABLE,
+                detail="Voucher code is invalid, please use another voucher"
+            )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Voucher not found, please check voucher code is valid!"
+        )
 
 
 # Select * from project_votes;
@@ -86,27 +147,10 @@ async def get_all_project_votes_view(db: Session = Depends(get_db)):
     return get_all_project_votes(db)
 
 
-@app.get("/voucher/{code}", response_model=VoucherCodes)
-async def get_voucher_code_view(code: int, db: Session = Depends(get_db)):
-    return get_voucher(db, code)
+@app.post("/voucher/vote/")
+async def post_voucher_vote_view(code: str, proj_id: int, db: Session = Depends(get_db)):
+    voucher_code = int(code)
+    update_voucher(db, voucher_code, proj_id)
+    update_project_vote_count(db, proj_id)
 
-
-@app.post("/voucher/vote/{code}")
-async def post_voucher_vote_view(code: int, proj_id: int, de: Session = Depends(get_db)):
-    return {"VoucherCode": code, "ProjectId": proj_id}
-
-
-#
-# @app.post("/vote/")
-# async def vote_for_project(voucher_code: int, project_id: int):
-#     # Algorithm
-#     # Search the database for the given voucher code - if not found, return an error
-#     # Check that the expiry is still within date or that the voucher has not already been used
-#     #   - if not, return message saying that the voucher has expired or that it has already been used
-#     # Update the column with the voucher code:
-#     #   - mark "used" column as true and update the project id column with the id that the user has voted for
-#     # Update the vote counts:
-#     #  - for each project id, execute a count query that will return how many times a project has been voted for
-#     #  - update the project table with the new count
-#
-#     return voucher_code, project_id
+    return {"message": "voting successful"}
